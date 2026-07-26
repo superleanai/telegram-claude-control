@@ -420,7 +420,9 @@ class JobStore:
     cannot survive a restart, so any row still marked "running" at startup
     is flagged "interrupted" (the conversation itself can still be continued
     normally via --resume with a fresh /ask or /task -- only that specific
-    job's progress tracking was lost)."""
+    job's progress tracking was lost). Those rows are collected in
+    interrupted_on_startup so main() can still get a final message to
+    Telegram for them, same as a normal completion would."""
 
     def __init__(self, path):
         self.path = path
@@ -439,6 +441,9 @@ class JobStore:
                     result TEXT
                 )"""
             )
+            self.interrupted_on_startup = db.execute(
+                "SELECT job_id, chat_id, thread_id, prompt FROM jobs WHERE status = 'running'"
+            ).fetchall()
             db.execute("UPDATE jobs SET status = 'interrupted' WHERE status = 'running'")
 
     def _connect(self):
@@ -1198,6 +1203,15 @@ def main():
         register_bot_commands()
     except Exception as error:
         print(f"telegram-claude-control: setMyCommands failed: {error}", file=sys.stderr, flush=True)
+    for job_id, chat_id, thread_id, prompt in JOBS.interrupted_on_startup:
+        try:
+            reply(
+                chat_id,
+                f"⚠️ Background job {job_id} was interrupted by a controller restart before finishing.\nPrompt: {prompt[:800]}\nResume with /ask or /task on this conversation to continue.",
+                None if thread_id == "None" else int(thread_id),
+            )
+        except Exception as error:
+            print(f"telegram-claude-control: interrupted-job notice failed for {job_id}: {error}", file=sys.stderr, flush=True)
     while True:
         try:
             updates = api("getUpdates", {"offset": state.get("offset", 0), "timeout": 30, "allowed_updates": json.dumps(["message", "callback_query"])})
