@@ -20,6 +20,8 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/newsession` | Forgets the headless session ID for this conversation; the next message starts a fresh `claude -p` session. |
 | `/model` | Shows the model for this conversation and offers `sonnet`/`opus`/`haiku` as buttons. |
 | `/model <name>` | Sets `--model <name>` for this conversation's `claude -p` calls (`/model default` clears it). |
+| `/projects` | Shows/picks the project (a git repo with a remote, found directly under `TELEGRAM_CLAUDE_PROJECTS_DIR`) used as this conversation's working directory, as buttons. |
+| `/projects <name>` | Sets project `<name>` as this conversation's cwd, and clears its session (`/projects default` resets to the default workspace). |
 | `/usage` | Current session/weekly usage against your plan's limits — free, instant, uses no tokens. `/help` also offers this as a button. |
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
 | `/sh <command>` | Runs a shell command directly (not through tmux) and returns its combined stdout/stderr. |
@@ -66,15 +68,16 @@ like `/ask`, `/task`, `/sh`, `/tmux`, `/cancel`, `/model <name>`.
 
 One-letter shortcuts save typing on a phone: `h`=`/help` `s`=`/status`
 `v`=`/screen` `i`=`/interrupt` `r`=`/restart` `t`=`/tasks` (bare) or `/task`
-(`t <prompt>`) `a`=`/model` (bare) or `/model <name>` (`a <name>`) `u`=`/usage`
+(`t <prompt>`) `a`=`/model` (bare) or `/model <name>` (`a <name>`)
+`p`=`/projects` (bare) or `/projects <name>` (`p <name>`) `u`=`/usage`
 `m <text>`=`/tmux <text>` `x <cmd>`=`/sh <cmd>` `c <prompt>`=`/ask <prompt>`.
 Only an exact `<letter>` or `<letter> <rest>` triggers a shortcut —
 anything else (including sentences that happen to start with one of these
 letters, e.g. "im on my way") falls through to the normal `/ask` prompt path
-unchanged. The one exception is `x`/`m`/`t`/`c`/`a`: a message that
+unchanged. The one exception is `x`/`m`/`t`/`c`/`a`/`p`: a message that
 genuinely starts with one of those letters followed by a space (e.g. "x-ray"
 typed as "x ray gun") will be misread as a shortcut — say it another way, or
-use the full `/sh`/`/tmux`/`/task`/`/ask`/`/model` command instead.
+use the full `/sh`/`/tmux`/`/task`/`/ask`/`/model`/`/projects` command instead.
 
 `/usage` runs Claude Code's own built-in `/usage` command (aliased
 `/cost`/`/stats`) directly via `claude -p "/usage" --output-format json` —
@@ -87,6 +90,17 @@ The per-conversation model choice (`/model`) is persisted the same way the
 `--resume` session id is — it survives a controller restart and is
 independent of `/newsession`, which only clears the conversation history,
 not the model.
+
+`/projects` lets one controller (and one Telegram bot) work across several
+repos instead of being pinned to `TELEGRAM_CLAUDE_WORKSPACE`: a "project" is
+any direct subdirectory of `TELEGRAM_CLAUDE_PROJECTS_DIR` (default `$HOME`)
+that's a git repo with at least one remote configured — discovered fresh
+each time you run `/projects`, not configured by hand. Selecting one sets
+it as this conversation's `cwd` for every subsequent `/ask`, `/task`, etc.,
+and also clears the conversation's `--resume` session id, since Claude Code
+scopes a session's history to the cwd it was started in — resuming it under
+a different project's directory wouldn't work anyway. Like `/model`, the
+selection is per-conversation and persists across a controller restart.
 
 The first chat must pair using a secret pairing code. Once paired, messages
 from all other chats are silently ignored. In Telegram forum groups, each
@@ -216,7 +230,8 @@ Optional environment variables:
 | `TELEGRAM_CLAUDE_STATE` | `~/.local/state/telegram-claude-control.json` | Pairing state and Telegram update offset. |
 | `TELEGRAM_CLAUDE_JOBS_DB` | `~/.local/state/telegram-claude-control-jobs.db` | SQLite log of `/task` jobs, for `/tasks` history across restarts. |
 | `TELEGRAM_CLAUDE_SESSION` | `claude` | tmux target session for the `/tmux` bridge. |
-| `TELEGRAM_CLAUDE_WORKSPACE` | `$HOME` | Working directory for headless `claude -p` calls. |
+| `TELEGRAM_CLAUDE_WORKSPACE` | `$HOME` | Default working directory for headless `claude -p` calls, used when a conversation has no `/projects` selection. |
+| `TELEGRAM_CLAUDE_PROJECTS_DIR` | `$HOME` | Directory `/projects` scans for selectable project subdirectories. |
 | `TELEGRAM_CLAUDE_BIN` | `~/.local/bin/claude` | Path to the `claude` executable. |
 | `TELEGRAM_CLAUDE_PERMISSION_MODE` | *(unset)* | Passed as `--permission-mode` to headless calls. Leave unset to inherit whatever `permissions.defaultMode` is configured in `~/.claude/settings.json`. |
 | `TELEGRAM_CLAUDE_ASK_TIMEOUT` | `600` | Seconds to wait for a headless `claude -p` turn before giving up. |

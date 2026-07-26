@@ -25,6 +25,9 @@ JOBS_DB_PATH = os.environ.get("TELEGRAM_CLAUDE_JOBS_DB", os.path.expanduser("~/.
 SESSION = os.environ.get("TELEGRAM_CLAUDE_SESSION", "claude")
 WORKSPACE = os.environ.get("TELEGRAM_CLAUDE_WORKSPACE", os.path.expanduser("~"))
 CLAUDE_BIN = os.environ.get("TELEGRAM_CLAUDE_BIN", os.path.expanduser("~/.local/bin/claude"))
+# Root directory /projects discovers "projects" under: any direct
+# subdirectory that's a git repo with at least one remote.
+PROJECTS_DIR = os.environ.get("TELEGRAM_CLAUDE_PROJECTS_DIR", os.path.expanduser("~"))
 # Left unset by default: headless calls then inherit whatever permission mode
 # is configured in ~/.claude/settings.json on this host. Set this to
 # constrain headless requests (e.g. "plan" or "acceptEdits") independent of
@@ -57,6 +60,7 @@ BOT_COMMANDS = [
     ("ask", "Headless claude -p with a prompt (or just send plain text)"),
     ("newsession", "Forget this conversation and start fresh"),
     ("model", "Show/pick the Claude model for this conversation"),
+    ("projects", "Show/pick the project (folder) used as this conversation's cwd"),
     ("usage", "Current session/weekly usage against your plan limits"),
     ("task", "Run claude -p in the background, no timeout"),
     ("tasks", "List recent background jobs"),
@@ -165,9 +169,10 @@ class ClaudeHeadless:
     time -- otherwise one /task job would freeze every other topic for as
     long as it runs."""
 
-    def __init__(self, sessions=None, models=None, on_change=None):
+    def __init__(self, sessions=None, models=None, projects=None, on_change=None):
         self.sessions = sessions if sessions is not None else {}
         self.models = models if models is not None else {}
+        self.projects = projects if projects is not None else {}
         self.on_change = on_change or (lambda: None)
         self._locks_guard = threading.Lock()
         self._conversation_locks = {}
@@ -185,6 +190,22 @@ class ClaudeHeadless:
 
     def get_model(self, conversation_id):
         return self.models.get(str(conversation_id))
+
+    def select_project(self, conversation_id, project):
+        """project=None resets the conversation to the default WORKSPACE.
+        Also clears the conversation's --resume session id: Claude Code
+        scopes a session's history to the cwd it was started in, so
+        resuming it under a different project's cwd wouldn't work anyway."""
+        with STATE_LOCK:
+            if project:
+                self.projects[str(conversation_id)] = project
+            else:
+                self.projects.pop(str(conversation_id), None)
+            self.sessions.pop(str(conversation_id), None)
+        self.on_change()
+
+    def get_project(self, conversation_id):
+        return self.projects.get(str(conversation_id))
 
     def _conversation_lock(self, conversation_id):
         key = str(conversation_id)
@@ -207,9 +228,11 @@ class ClaudeHeadless:
         model = self.models.get(str(conversation_id))
         if model:
             args += ["--model", model]
+        project = self.projects.get(str(conversation_id))
+        cwd = os.path.join(PROJECTS_DIR, project) if project else WORKSPACE
         process = subprocess.Popen(
             args,
-            cwd=WORKSPACE,
+            cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -773,6 +796,40 @@ def cancel_job(job_id):
     return f"Cancelled {job_id}." if CLAUDE.cancel_job(job_id) else f"No running background job {job_id}."
 
 
+def list_projects():
+    """Every direct subdirectory of PROJECTS_DIR that's a git repo with at
+    least one remote configured -- a "project" selectable via /projects."""
+    try:
+        entries = sorted(os.listdir(PROJECTS_DIR))
+    except OSError:
+        return []
+    projects = []
+    for name in entries:
+        path = os.path.join(PROJECTS_DIR, name)
+        if not os.path.isdir(os.path.join(path, ".git")):
+            continue
+        try:
+            result = subprocess.run(["git", "-C", path, "remote"], capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            projects.append(name)
+    return projects
+
+
+def projects_entry(conversation_id):
+    """(text, buttons) listing every discovered project as a button
+    (callback_data "/projects <name>"), plus one to reset to the default
+    workspace. Shows which project (if any) is currently selected."""
+    current = CLAUDE.get_project(conversation_id) or "(default workspace)"
+    projects = list_projects()
+    if not projects:
+        return f"No git projects with a remote found under {PROJECTS_DIR}.\nCurrent: {current}", None
+    buttons = [(("🟢 " if name == CLAUDE.get_project(conversation_id) else "") + name, f"/projects {name}") for name in projects]
+    buttons.append(("(default workspace)", "/projects default"))
+    return f"Current project: {current}\nPick one:", buttons
+
+
 def usage_report():
     """Runs claude -p "/usage" -- a built-in Claude Code command
     (supportsNonInteractive) that reports current session/weekly usage
@@ -898,6 +955,7 @@ ONE_LETTER_SHORTCUTS = {
     "t": "/tasks",
     "a": "/model",
     "u": "/usage",
+    "p": "/projects",
 }
 # One letter plus " <argument>".
 PREFIXED_SHORTCUTS = {
@@ -906,6 +964,7 @@ PREFIXED_SHORTCUTS = {
     "x": "/sh",
     "c": "/ask",
     "a": "/model",
+    "p": "/projects",
 }
 
 
@@ -961,18 +1020,21 @@ def handle(message, state):
             "/screen: every tmux pane on the server as a button, tap to see its content. "
             "/model: show/pick the Claude model for this conversation (sonnet/opus/haiku or any model id); "
             "/model default resets it. "
+            "/projects: show/pick the project (a git repo with a remote, directly under "
+            f"{PROJECTS_DIR}) used as this conversation's working directory; /projects default resets it. "
             "/usage: current session/weekly usage against your plan limits (free, instant, no tokens used). "
             "/status, /interrupt. "
             "One-letter shortcuts: h=help s=status v=screen i=interrupt r=restart t=tasks (`t <prompt>`=/task) "
-            "a=model (`a <name>` selects) u=usage m <text>=/tmux x <cmd>=/sh c <prompt>=/ask. "
+            "a=model (`a <name>` selects) p=projects (`p <name>` selects) u=usage m <text>=/tmux x <cmd>=/sh c <prompt>=/ask. "
             "Tap a button below for the commands that need no arguments, or type / for Telegram's own "
             "command menu (with the rest, autocompleted so you can just add the argument).",
             thread_id,
             buttons=[
                 ("usage", "/usage"), ("status", "/status"),
                 ("screen", "/screen"), ("tasks", "/tasks"),
-                ("model", "/model"), ("interrupt", "/interrupt"),
-                ("newsession", "/newsession"), ("restart", "/restart"),
+                ("model", "/model"), ("projects", "/projects"),
+                ("interrupt", "/interrupt"), ("newsession", "/newsession"),
+                ("restart", "/restart"),
             ],
             columns=2,
         )
@@ -1053,6 +1115,19 @@ def handle(message, state):
         else:
             CLAUDE.set_model(thread_id, model_name)
             reply(chat_id, f"Model set to {model_name} for this conversation (takes effect next turn).", thread_id)
+    elif command == "/projects":
+        text, buttons = projects_entry(thread_id)
+        reply(chat_id, text, thread_id, buttons=buttons)
+    elif command.startswith("/projects "):
+        project_name = command[10:].strip()
+        if project_name in ("default", "reset", "clear", ""):
+            CLAUDE.select_project(thread_id, None)
+            reply(chat_id, "Project reset to the default workspace. Next message starts a new claude -p session there.", thread_id)
+        elif project_name in list_projects():
+            CLAUDE.select_project(thread_id, project_name)
+            reply(chat_id, f"Project set to {project_name}. Next message starts a new claude -p session there.", thread_id)
+        else:
+            reply(chat_id, f"No project named {project_name}. Use /projects to list them.", thread_id)
     elif command == "/newsession":
         CLAUDE.reset(thread_id)
         reply(chat_id, "Headless conversation cleared. Next message starts a new claude -p session.", thread_id)
@@ -1097,6 +1172,7 @@ def main():
     # are already reflected in the next write_state(state) call below.
     CLAUDE.sessions = state.setdefault("sessions", {})
     CLAUDE.models = state.setdefault("models", {})
+    CLAUDE.projects = state.setdefault("projects", {})
     CLAUDE.on_change = lambda: write_state(state)
     try:
         # Establish the sender's TLS connection before the first user message,
