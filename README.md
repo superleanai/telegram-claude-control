@@ -21,7 +21,7 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/model` | Shows the model for this conversation and offers `sonnet`/`opus`/`haiku` as buttons. |
 | `/model <name>` | Sets `--model <name>` for this conversation's `claude -p` calls (`/model default` clears it). |
 | `/projects` | Shows/picks the project (a git repo with a remote, found directly under `TELEGRAM_CLAUDE_PROJECTS_DIR`) used as this conversation's working directory, as buttons. |
-| `/projects <name>` | Sets project `<name>` as this conversation's cwd, and clears its session (`/projects default` resets to the default workspace). |
+| `/projects <name>` | Sets project `<name>` as this conversation's cwd, and clears its session (`/projects default` resets it to `TELEGRAM_CLAUDE_WORKSPACE`). |
 | `/usage` | Current session/weekly usage against your plan's limits — free, instant, uses no tokens. `/help` also offers this as a button. |
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
 | `/sh <command>` | Runs a shell command directly (not through tmux) and returns its combined stdout/stderr. |

@@ -833,14 +833,14 @@ def list_projects():
 
 def projects_entry(conversation_id):
     """(text, buttons) listing every discovered project as a button
-    (callback_data "/projects <name>"), plus one to reset to the default
-    workspace. Shows which project (if any) is currently selected."""
-    current = CLAUDE.get_project(conversation_id) or "(default workspace)"
+    (callback_data "/projects <name>"), plus one to reset to WORKSPACE.
+    Shows which project (if any) is currently selected."""
+    current = CLAUDE.get_project(conversation_id) or WORKSPACE
     projects = list_projects()
     if not projects:
         return f"No git projects with a remote found under {PROJECTS_DIR}.\nCurrent: {current}", None
     buttons = [(("🟢 " if name == CLAUDE.get_project(conversation_id) else "") + name, f"/projects {name}") for name in projects]
-    buttons.append(("(default workspace)", "/projects default"))
+    buttons.append((f"(default: {WORKSPACE})", "/projects default"))
     return f"Current project: {current}\nPick one:", buttons
 
 
@@ -1136,10 +1136,10 @@ def handle(message, state):
         project_name = command[10:].strip()
         if project_name in ("default", "reset", "clear", ""):
             CLAUDE.select_project(thread_id, None)
-            reply(chat_id, "Project reset to the default workspace. Next message starts a new claude -p session there.", thread_id)
+            reply(chat_id, f"Project reset to {WORKSPACE}. Next message starts a new claude -p session there.", thread_id)
         elif project_name in list_projects():
             CLAUDE.select_project(thread_id, project_name)
-            reply(chat_id, f"Project set to {project_name}. Next message starts a new claude -p session there.", thread_id)
+            reply(chat_id, f"Project set to {os.path.join(PROJECTS_DIR, project_name)}. Next message starts a new claude -p session there.", thread_id)
         else:
             reply(chat_id, f"No project named {project_name}. Use /projects to list them.", thread_id)
     elif command == "/newsession":
