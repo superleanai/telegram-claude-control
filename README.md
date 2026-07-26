@@ -25,7 +25,7 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/usage` | Current session/weekly usage against your plan's limits — free, instant, uses no tokens. `/help` also offers this as a button. |
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
 | `/sh <command>` | Runs a shell command directly (not through tmux) and returns its combined stdout/stderr. |
-| `/task <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. |
+| `/task <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. Replies with a 3-letter job id (e.g. `abc`), short enough to type back for `/tasks <job_id>` or `/cancel <job_id>`. |
 | `/tasks` | One message listing the 5 most recent background jobs (icon, id, status, duration, prompt), each also a tappable button into its detail view — history survives a controller restart. |
 | `/tasks <job_id>` | Detail view: status, duration, thread, full prompt, and last message/error — what tapping a `/tasks` button does. |
 | `/cancel <job_id>` | Kills a running background job. |

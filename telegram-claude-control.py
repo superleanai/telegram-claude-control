@@ -10,14 +10,15 @@ import difflib
 import http.client
 import json
 import os
+import random
 import shutil
 import sqlite3
+import string
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
-import uuid
 
 CONFIG_PATH = os.environ.get("TELEGRAM_CLAUDE_CONFIG", os.path.expanduser("~/.config/telegram-claude-control.env"))
 STATE_PATH = os.environ.get("TELEGRAM_CLAUDE_STATE", os.path.expanduser("~/.local/state/telegram-claude-control.json"))
@@ -314,7 +315,22 @@ class ClaudeHeadless:
         finally:
             lock.release()
 
-    def start_background(self, prompt, conversation_id, thread_id, notify, on_start=None, on_done=None):
+    def _new_job_id(self, job_id_exists):
+        """3 random lowercase letters -- short and easy to type on a phone.
+        Retries against both the in-memory registry (self.jobs, must be
+        called with self._jobs_lock held) and the caller's durable-history
+        check (job_id_exists, e.g. JOBS.get): a sequential counter would
+        collide with still-present historical rows as soon as one job ran
+        before a restart, since self._job_seq would reset to 0 but JOBS
+        (SQLite) does not. 26**3 = 17,576 combinations makes collisions rare
+        in practice for a single-user bot, but not impossible."""
+        for _ in range(100):
+            candidate = "".join(random.choices(string.ascii_lowercase, k=3))
+            if candidate not in self.jobs and not job_id_exists(candidate):
+                return candidate
+        raise RuntimeError("could not allocate a unique task id")
+
+    def start_background(self, prompt, conversation_id, thread_id, notify, on_start=None, on_done=None, job_id_exists=None):
         """Starts prompt as a background job that is not bound by
         ASK_TIMEOUT: it runs on a daemon thread owned by the long-lived
         controller process itself, so it survives well past any single
@@ -329,15 +345,12 @@ class ClaudeHeadless:
         another /task job)."""
         on_start = on_start or (lambda job_id: None)
         on_done = on_done or (lambda job_id, status, text: None)
+        job_id_exists = job_id_exists or (lambda job_id: False)
         lock = self._conversation_lock(conversation_id)
         if not lock.acquire(blocking=False):
             return None
-        # uuid4, not a sequence counter: self._job_seq resets to 0 on every
-        # restart, but JOBS (SQLite) is durable across restarts, so a
-        # sequential id would collide with a still-present historical row
-        # (UNIQUE constraint failure) as soon as a job ran before the restart.
-        job_id = f"bg{uuid.uuid4().hex[:8]}"
         with self._jobs_lock:
+            job_id = self._new_job_id(job_id_exists)
             self.jobs[job_id] = {"conversation_id": conversation_id, "thread_id": thread_id, "prompt": prompt, "started": time.time(), "process": None, "cancelled": False}
         try:
             on_start(job_id)
@@ -728,6 +741,7 @@ def start_task(chat_id, message_id, thread_id, prompt):
         notify=lambda text: reply(chat_id, text, thread_id),
         on_start=lambda job_id: JOBS.start(job_id, chat_id, thread_id, prompt),
         on_done=lambda job_id, status, text: JOBS.finish(job_id, status, text),
+        job_id_exists=lambda job_id: JOBS.get(job_id) is not None,
     )
     if job_id is None:
         reply(chat_id, "A request is already running for this conversation. Check /tasks, or wait for it to finish.", thread_id)
