@@ -1,3 +1,6 @@
+# Template: install.sh substitutes __REPO_DIR__ with this checkout's absolute
+# path when it installs the unit. Do not hardcode a path here -- the checkout
+# can live anywhere, under any directory name.
 [Unit]
 Description=Telegram controller for Claude Code
 After=network-online.target
@@ -5,7 +8,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 %h/claude-remote-control/telegram-claude-control.py
+ExecStart=/usr/bin/python3 __REPO_DIR__/telegram-claude-control.py
 Environment=TELEGRAM_CLAUDE_CONFIG=%h/.config/telegram-claude-control.env
 Environment=TELEGRAM_CLAUDE_STATE=%h/.local/state/telegram-claude-control.json
 Restart=on-failure

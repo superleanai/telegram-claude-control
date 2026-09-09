@@ -74,6 +74,15 @@ DIFF_PREVIEW_MAX_LINES = int(os.environ.get("TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES"
 USAGE_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_USAGE_TIMEOUT", "30"))
 # systemd --user unit installed by install.sh; /restart targets this.
 UNIT_NAME = os.environ.get("TELEGRAM_CLAUDE_UNIT", "telegram-claude-controller.service")
+# In a group, plain text is only taken as a prompt when it addresses the bot by
+# name -- otherwise the bot answers every message two humans send each other.
+# Defaults to the bot's own Telegram first name, discovered via getMe at
+# startup. Set it explicitly to use a different name, or to the empty string to
+# answer every message in a group. One-to-one chats are never gated: there is
+# no one else there to address.
+ADDRESS_NAME = os.environ.get("TELEGRAM_CLAUDE_ADDRESS_NAME")
+# Filled in at startup from getMe, for @username mentions and reply detection.
+BOT_IDENTITY = {"username": "", "id": None, "first_name": ""}
 # /model button shortcuts; /model <any other id> is also accepted verbatim.
 MODEL_PRESETS = ["sonnet", "opus", "haiku"]
 
@@ -1296,6 +1305,55 @@ def permitted(chat_id, state):
     return str(state.get("chat_id", "")) == str(chat_id)
 
 
+def address_name():
+    """The name the bot answers to in groups: ADDRESS_NAME if set (including
+    empty, meaning "answer everything"), otherwise the bot's own first name."""
+    if ADDRESS_NAME is not None:
+        return ADDRESS_NAME.strip()
+    return BOT_IDENTITY["first_name"].strip()
+
+
+def addressed(message, text):
+    """Is this group message aimed at the bot?
+
+    True when it opens with the bot's name, @mentions the bot anywhere, or
+    replies to one of the bot's own messages. Returns the prompt with a
+    leading name or mention stripped, so Claude sees "status?" rather than
+    "claude, status?".
+
+    Returns (False, None) when the message is two humans talking to each other.
+    """
+    reply_to = message.get("reply_to_message") or {}
+    if reply_to.get("from", {}).get("id") == BOT_IDENTITY["id"] and BOT_IDENTITY["id"]:
+        return True, text
+
+    username = BOT_IDENTITY["username"]
+    if username:
+        mention = re.compile(rf"@{re.escape(username)}\b", re.IGNORECASE)
+        if mention.search(text):
+            # Drop every mention of the bot, not just a leading one: "@bot ping"
+            # and "ping @bot" should both arrive as "ping".
+            return True, mention.sub("", text).strip()
+
+    name = address_name()
+    if not name:
+        # Explicitly disabled: behave as before and treat all text as a prompt.
+        return True, text
+
+    # For a bot named "claude": "claude", "claude:", "claude,", "hey claude --
+    # ..." all count, as long as the name is a whole word near the start.
+    # Requiring it at the start (after an optional greeting) keeps "ask claude
+    # about it later" from being read as an instruction to the bot.
+    opener = re.compile(
+        rf"^(?:hey|hi|hello|ok|okay|yo)?[\s,]*{re.escape(name)}\b[\s,:;\-–—]*",
+        re.IGNORECASE,
+    )
+    stripped = opener.sub("", text, count=1)
+    if stripped != text:
+        return True, stripped.strip() or text.strip()
+    return False, None
+
+
 # Bare one-letter shortcuts (no argument).
 ONE_LETTER_SHORTCUTS = {
     "h": "/help",
@@ -1502,8 +1560,15 @@ def handle(message, state):
             reply(chat_id, "Usage: /ask <prompt>", thread_id)
     elif command.startswith("/"):
         reply(chat_id, "Unknown command. Use /help.", thread_id)
-    else:
+    elif message.get("chat", {}).get("type", "private") == "private":
+        # Nobody else is in a one-to-one chat, so every message is for the bot.
         start_ask(chat_id, message["message_id"], thread_id, text)
+    else:
+        # In a group, stay quiet unless actually spoken to. Explicit /commands
+        # above are always honoured -- typing one is addressing the bot.
+        for_me, prompt = addressed(message, text)
+        if for_me:
+            start_ask(chat_id, message["message_id"], thread_id, prompt)
 
 
 def handle_callback(callback_query, state):
@@ -1537,8 +1602,23 @@ def main():
     CLAUDE.on_change = lambda: write_state(state)
     try:
         # Establish the sender's TLS connection before the first user message,
-        # making the immediate acknowledgement a reused connection.
-        api("getMe")
+        # making the immediate acknowledgement a reused connection. The reply
+        # also carries the identity the group name-gate needs.
+        me = api("getMe") or {}
+        BOT_IDENTITY.update(
+            username=me.get("username") or "",
+            id=me.get("id"),
+            first_name=me.get("first_name") or "",
+        )
+        if me.get("can_read_all_group_messages") is False:
+            print(
+                "telegram-claude-control: group privacy mode is ON -- in groups this bot "
+                "only receives /commands, @mentions and replies to itself, so plain text "
+                "will be silently ignored. Turn it off in BotFather (Bot Settings -> Group "
+                "Privacy) and re-add the bot to the group.",
+                file=sys.stderr,
+                flush=True,
+            )
     except Exception as error:
         print(f"telegram-claude-control: sender preflight failed: {error}", file=sys.stderr, flush=True)
     try:

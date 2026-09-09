@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs the Telegram Claude controller as a systemd --user service running
 # straight out of this checkout (no copy to ~/.local/share -- the unit's
-# ExecStart points back at this directory via %h-relative paths).
+# ExecStart is rewritten to this directory's absolute path at install time).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,8 +63,12 @@ EOF
 fi
 
 mkdir -p "$(dirname "$UNIT_DEST")"
-cp "$UNIT_SRC" "$UNIT_DEST"
-echo "Installed unit to $UNIT_DEST."
+# The template carries __REPO_DIR__ rather than a literal path: this checkout
+# can live anywhere, under any directory name, so its real path is only known
+# here. Installing the template verbatim pointed ExecStart at a stale path and
+# crash-looped with ENOENT for every checkout not named claude-remote-control.
+sed "s|__REPO_DIR__|$REPO_DIR|g" "$UNIT_SRC" > "$UNIT_DEST"
+echo "Installed unit to $UNIT_DEST (ExecStart -> $REPO_DIR)."
 
 systemctl --user daemon-reload
 systemctl --user enable "$UNIT_NAME"

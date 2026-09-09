@@ -109,6 +109,31 @@ topic (`message_thread_id`) gets its own independent `claude -p` session and
 replies land back in that same topic, so parallel topics never share or
 clobber each other's Claude conversation.
 
+**In a group, the bot only answers when addressed.** A group is a conversation
+between people, so treating every message as a prompt would make the bot reply
+to humans talking to each other. Plain text becomes a prompt only when it opens
+with the bot's name (`claude what's the load?`, `Claude: status?`,
+`hey claude - deploy it`), @mentions the bot anywhere, or replies to one of
+the bot's own messages — the name or mention is stripped before Claude sees the
+prompt. An explicit `/command` always counts as addressing it. The name is the
+bot's own Telegram first name by default; override or disable it with
+`TELEGRAM_CLAUDE_ADDRESS_NAME`. One-to-one chats are never gated, since there
+is nobody else there to address.
+
+**In a group, turn off the bot's privacy mode or only `/commands` reach it.**
+Telegram enables *group privacy mode* on every new bot, and a bot in that mode
+receives only messages that start with `/`, @mention it, or reply to one of its
+own messages. Everything else is never delivered to the bot at all — so the
+plain-text `/ask` path above, and the one-letter shortcuts, silently do nothing
+in a group: no reply, no error, nothing in the log, because the controller
+never sees an update. Fix it once in
+[BotFather](https://t.me/BotFather): `/mybots` → your bot → *Bot Settings* →
+*Group Privacy* → *Turn off*, then remove and re-add the bot to the group for
+the change to take effect. Verify with
+`curl -s https://api.telegram.org/bot<token>/getMe` — you want
+`"can_read_all_group_messages": true`. In a one-to-one chat with the bot none
+of this applies; privacy mode only governs groups.
+
 Only one request (foreground `/ask` or background `/task`) runs per topic at a
 time, since two processes can't safely share the same `--resume` session —
 a second request on the same topic is rejected with a "already running"
@@ -279,6 +304,7 @@ Optional environment variables:
 | `TELEGRAM_CLAUDE_USAGE_TIMEOUT` | `30` | Seconds to wait for `/usage` before giving up. |
 | `TELEGRAM_CLAUDE_UNIT` | `telegram-claude-controller.service` | systemd `--user` unit name that `/restart` restarts. |
 | `TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES` | `10` | Inline the diff in an edited-file notification when total changed lines (added + removed) is below this; otherwise show only the counts. |
+| `TELEGRAM_CLAUDE_ADDRESS_NAME` | the bot's own Telegram first name | In a **group**, the name plain text must open with for the bot to treat it as a prompt. Set to the empty string to answer every message instead. One-to-one chats are never gated. |
 
 ## Operational notes
 

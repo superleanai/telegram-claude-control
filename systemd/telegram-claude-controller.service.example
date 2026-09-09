@@ -1,3 +1,7 @@
+# System-wide template, to adapt by hand: replace USER with the service
+# account and REPO_DIR with the absolute path of your checkout. For a
+# `systemd --user` install, use install.sh and the .user.service template
+# instead -- it fills the path in for you.
 [Unit]
 Description=Telegram controller for Claude Code
 After=network-online.target
@@ -5,15 +9,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/remote-tmux/claude-remote-control/telegram-claude-control.py
-Environment=TELEGRAM_CLAUDE_CONFIG=/home/remote-tmux/.config/telegram-claude-control.env
-Environment=TELEGRAM_CLAUDE_STATE=/home/remote-tmux/.local/state/telegram-claude-control.json
+ExecStart=/usr/bin/python3 REPO_DIR/telegram-claude-control.py
+Environment=TELEGRAM_CLAUDE_CONFIG=/home/USER/.config/telegram-claude-control.env
+Environment=TELEGRAM_CLAUDE_STATE=/home/USER/.local/state/telegram-claude-control.json
 Environment=TELEGRAM_CLAUDE_SESSION=claude
-Environment=TELEGRAM_CLAUDE_WORKSPACE=/home/remote-tmux
-Environment=TELEGRAM_CLAUDE_BIN=/home/remote-tmux/.local/bin/claude
+Environment=TELEGRAM_CLAUDE_WORKSPACE=/home/USER
+Environment=TELEGRAM_CLAUDE_BIN=/home/USER/.local/bin/claude
 Restart=on-failure
 RestartSec=5
-User=remote-tmux
+User=USER
 
 [Install]
 WantedBy=default.target
