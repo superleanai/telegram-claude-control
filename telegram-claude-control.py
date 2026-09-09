@@ -5,13 +5,23 @@ https://github.com/monperrus/telegram-tmux-controller, swapping that
 project's Codex app-server JSONL client for Claude Code's documented
 non-interactive mode (`claude -p --output-format stream-json --verbose
 [--resume <id>]`), parsing the JSONL event stream so each completed
-file-editing tool call reaches Telegram as its own message."""
+file-editing tool call reaches Telegram as its own message.
+
+/task jobs instead go through `claude --bg`, Claude Code's own background
+agents: they are hosted by its daemon rather than by this process, so they
+survive a controller restart, and they report progress, permission prompts
+and their final answer back through hooks posting to a unix socket here."""
 import difflib
 import http.client
+import http.server
 import json
 import os
 import random
+import re
+import shlex
 import shutil
+import socket
+import socketserver
 import sqlite3
 import string
 import subprocess
@@ -36,9 +46,25 @@ PROJECTS_DIR = os.environ.get("TELEGRAM_CLAUDE_PROJECTS_DIR", os.path.expanduser
 PERMISSION_MODE = os.environ.get("TELEGRAM_CLAUDE_PERMISSION_MODE", "")
 ASK_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_ASK_TIMEOUT", "600"))
 SH_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_SH_TIMEOUT", "60"))
-# /task jobs run detached from the ASK_TIMEOUT-bound foreground path (see
-# ClaudeHeadless.start_background), so they get their own, much longer cap.
-TASK_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_TASK_TIMEOUT", "14400"))
+# /task jobs are hosted by Claude Code's own background daemon (claude --bg),
+# not by this process, so they have no timeout at all -- they outlive the
+# controller. They report back through hooks posting to HOOK_SOCKET_PATH; see
+# start_job and handle_hook. TELEGRAM_CLAUDE_TASK_TIMEOUT (a cap this process
+# used to enforce) is therefore no longer read.
+HOOK_SOCKET_PATH = os.environ.get("TELEGRAM_CLAUDE_HOOK_SOCKET", os.path.expanduser("~/.local/state/telegram-claude-control-hooks.sock"))
+HOOK_SETTINGS_PATH = os.environ.get("TELEGRAM_CLAUDE_HOOK_SETTINGS", os.path.expanduser("~/.local/state/telegram-claude-control-hooks.json"))
+# Tools a /task job must get an explicit Telegram Allow/Deny tap for, as a
+# hook matcher ("Bash", "Bash|Write|Edit", "*", ...). Empty (the default)
+# means no extra gate: jobs run under whatever PERMISSION_MODE gives them.
+# This is enforced with a PreToolUse hook, which is the one hook event whose
+# allow/deny decision Claude Code honours in a background session --
+# PermissionRequest fires there too, but its decision is ignored (2.1.x), so
+# a prompt Claude Code raises by itself can only be reported, not answered.
+CONFIRM_TOOLS = os.environ.get("TELEGRAM_CLAUDE_CONFIRM_TOOLS", "")
+# How long a background job may sit blocked waiting for that tap. On expiry
+# the hook declines to decide and the tool call goes back to Claude Code's
+# normal permission flow.
+PERMISSION_ASK_TIMEOUT = int(os.environ.get("TELEGRAM_CLAUDE_PERMISSION_ASK_TIMEOUT", "1800"))
 # Inline the diff in the edited-file notification when total changed lines
 # (added + removed) is below this. Above it, only the +/- counts are shown.
 DIFF_PREVIEW_MAX_LINES = int(os.environ.get("TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES", "10"))
@@ -63,7 +89,7 @@ BOT_COMMANDS = [
     ("model", "Show/pick the Claude model for this conversation"),
     ("projects", "Show/pick the project (folder) used as this conversation's cwd"),
     ("usage", "Current session/weekly usage against your plan limits"),
-    ("task", "Run claude -p in the background, no timeout"),
+    ("task", "Run a claude --bg background agent, no timeout"),
     ("tasks", "List recent background jobs"),
     ("cancel", "Cancel a running background job"),
     ("sh", "Run a shell command directly"),
@@ -177,8 +203,6 @@ class ClaudeHeadless:
         self.on_change = on_change or (lambda: None)
         self._locks_guard = threading.Lock()
         self._conversation_locks = {}
-        self._jobs_lock = threading.Lock()
-        self.jobs = {}
 
     def set_model(self, conversation_id, model):
         """model=None resets the conversation to the CLI's own default."""
@@ -213,24 +237,14 @@ class ClaudeHeadless:
         with self._locks_guard:
             return self._conversation_locks.setdefault(key, threading.Lock())
 
-    def _execute(self, prompt, conversation_id, notify, timeout, on_process=None):
+    def _execute(self, prompt, conversation_id, notify, timeout):
         """One `claude -p` turn: spawns the process, parses its JSONL event
         stream (calling notify(text) per completed file-editing tool call),
-        and returns the final assistant result text. Shared by the
-        foreground /ask path and background /task jobs -- they differ only in
-        their timeout and in how the caller is allowed to observe/cancel the
-        process (on_process)."""
-        args = [CLAUDE_BIN, "-p", prompt, "--output-format", "stream-json", "--verbose"]
-        session_id = self.sessions.get(str(conversation_id))
-        if session_id:
-            args += ["--resume", session_id]
-        if PERMISSION_MODE:
-            args += ["--permission-mode", PERMISSION_MODE]
-        model = self.models.get(str(conversation_id))
-        if model:
-            args += ["--model", model]
-        project = self.projects.get(str(conversation_id))
-        cwd = os.path.join(PROJECTS_DIR, project) if project else WORKSPACE
+        and returns the final assistant result text. This is the foreground
+        /ask path; /task jobs are dispatched with `claude --bg` instead (see
+        start_job) and never come through here."""
+        prefix, cwd = self.command_prefix(conversation_id)
+        args = [CLAUDE_BIN, "-p", prompt, "--output-format", "stream-json", "--verbose"] + prefix
         process = subprocess.Popen(
             args,
             cwd=cwd,
@@ -239,8 +253,6 @@ class ClaudeHeadless:
             text=True,
             bufsize=1,
         )
-        if on_process:
-            on_process(process)
         timed_out = threading.Event()
 
         def on_timeout():
@@ -315,92 +327,34 @@ class ClaudeHeadless:
         finally:
             lock.release()
 
-    def _new_job_id(self, job_id_exists):
-        """3 random lowercase letters -- short and easy to type on a phone.
-        Retries against both the in-memory registry (self.jobs, must be
-        called with self._jobs_lock held) and the caller's durable-history
-        check (job_id_exists, e.g. JOBS.get): a sequential counter would
-        collide with still-present historical rows as soon as one job ran
-        before a restart, since self._job_seq would reset to 0 but JOBS
-        (SQLite) does not. 26**3 = 17,576 combinations makes collisions rare
-        in practice for a single-user bot, but not impossible."""
-        for _ in range(100):
-            candidate = "".join(random.choices(string.ascii_lowercase, k=3))
-            if candidate not in self.jobs and not job_id_exists(candidate):
-                return candidate
-        raise RuntimeError("could not allocate a unique task id")
+    def command_prefix(self, conversation_id):
+        """The per-conversation `claude` invocation bits shared by the
+        foreground (`-p`) path and background (`--bg`) jobs: resume id,
+        permission mode, model, and working directory. Returns
+        (args, cwd)."""
+        args = []
+        session_id = self.sessions.get(str(conversation_id))
+        if session_id:
+            args += ["--resume", session_id]
+        if PERMISSION_MODE:
+            args += ["--permission-mode", PERMISSION_MODE]
+        model = self.models.get(str(conversation_id))
+        if model:
+            args += ["--model", model]
+        project = self.projects.get(str(conversation_id))
+        return args, os.path.join(PROJECTS_DIR, project) if project else WORKSPACE
 
-    def start_background(self, prompt, conversation_id, thread_id, notify, on_start=None, on_done=None, job_id_exists=None):
-        """Starts prompt as a background job that is not bound by
-        ASK_TIMEOUT: it runs on a daemon thread owned by the long-lived
-        controller process itself, so it survives well past any single
-        `claude -p` process's lifetime. notify(text) is used both for
-        progress messages and for the final completion/failure message,
-        exactly like the foreground path. on_start(job_id) fires
-        synchronously, before the worker thread launches (so a caller that
-        wants to durably record "job started" can't race the job finishing
-        first); on_done(job_id, status, text) fires exactly once, with
-        status one of "completed"/"failed"/"cancelled". Returns the new
-        job_id, or None if this conversation is already busy (foreground or
-        another /task job)."""
-        on_start = on_start or (lambda job_id: None)
-        on_done = on_done or (lambda job_id, status, text: None)
-        job_id_exists = job_id_exists or (lambda job_id: False)
-        lock = self._conversation_lock(conversation_id)
-        if not lock.acquire(blocking=False):
-            return None
-        with self._jobs_lock:
-            job_id = self._new_job_id(job_id_exists)
-            self.jobs[job_id] = {"conversation_id": conversation_id, "thread_id": thread_id, "prompt": prompt, "started": time.time(), "process": None, "cancelled": False}
-        try:
-            on_start(job_id)
-        except Exception:
-            # on_start (JOBS.start) can still fail for other reasons (e.g. a
-            # locked db file). Without this, the lock/registry entry above
-            # would leak permanently -- silently blocking every future /ask
-            # and /task on this conversation with "already running" even
-            # though no job is actually running.
-            with self._jobs_lock:
-                self.jobs.pop(job_id, None)
-            lock.release()
-            raise
-
-        def on_process(process):
-            with self._jobs_lock:
-                if job_id in self.jobs:
-                    self.jobs[job_id]["process"] = process
-
-        def worker():
-            try:
-                result = self._execute(prompt, conversation_id, notify, TASK_TIMEOUT, on_process=on_process)
-                notify(f"✅ Background job {job_id} finished:\n{result}")
-                on_done(job_id, "completed", result)
-            except Exception as error:
-                with self._jobs_lock:
-                    cancelled = self.jobs.get(job_id, {}).get("cancelled", False)
-                if cancelled:
-                    notify(f"🚫 Background job {job_id} was cancelled.")
-                    on_done(job_id, "cancelled", str(error))
-                else:
-                    friendly = _friendly_claude_error(error)
-                    notify(f"❌ Background job {job_id} failed: {friendly}")
-                    on_done(job_id, "failed", friendly)
-            finally:
-                with self._jobs_lock:
-                    self.jobs.pop(job_id, None)
-                lock.release()
-
-        threading.Thread(target=worker, daemon=True).start()
-        return job_id
-
-    def cancel_job(self, job_id):
-        with self._jobs_lock:
-            job = self.jobs.get(job_id)
-            if job is None or job["process"] is None:
-                return False
-            job["cancelled"] = True
-        job["process"].kill()
-        return True
+    def adopt_session(self, conversation_id, session_id):
+        """Point a conversation at a session id produced elsewhere (a /task
+        job's `claude --bg` session), so a later /ask continues from the
+        work that job did."""
+        if not session_id:
+            return
+        with STATE_LOCK:
+            if self.sessions.get(str(conversation_id)) == session_id:
+                return
+            self.sessions[str(conversation_id)] = session_id
+        self.on_change()
 
     def reset(self, conversation_id=None):
         with STATE_LOCK:
@@ -413,16 +367,19 @@ CLAUDE = ClaudeHeadless()
 
 
 class JobStore:
-    """Durable log of /task jobs (SQLite) so /tasks history and status survive
-    a controller restart -- unlike ClaudeHeadless's in-memory registry,
-    which only knows about jobs from the current process's lifetime. This is
-    a log, not a resumable queue: the underlying claude -p subprocess itself
-    cannot survive a restart, so any row still marked "running" at startup
-    is flagged "interrupted" (the conversation itself can still be continued
-    normally via --resume with a fresh /ask or /task -- only that specific
-    job's progress tracking was lost). Those rows are collected in
-    interrupted_on_startup so main() can still get a final message to
-    Telegram for them, same as a normal completion would."""
+    """Durable registry of /task jobs (SQLite). Since a job is now a `claude
+    --bg` session hosted by Claude Code's own background daemon -- not a
+    child of this process -- this table is the *only* link between a live
+    session and the Telegram chat that started it: the hooks those sessions
+    fire (see HookServer) arrive with nothing but a session id, and are
+    routed back to a chat by looking the id up here. That indirection is
+    what makes a job survive a controller restart end to end: the session
+    keeps working while the controller is down, and its hooks find the row
+    again the moment the socket is back.
+
+    Rows still marked "running" at startup are not blindly declared
+    interrupted any more; main() reconciles them against `claude agents
+    --json` first (see reconcile_jobs)."""
 
     def __init__(self, path):
         self.path = path
@@ -441,24 +398,26 @@ class JobStore:
                     result TEXT
                 )"""
             )
-            self.interrupted_on_startup = db.execute(
-                "SELECT job_id, chat_id, thread_id, prompt FROM jobs WHERE status = 'running'"
-            ).fetchall()
-            db.execute("UPDATE jobs SET status = 'interrupted' WHERE status = 'running'")
+            # Added after the switch to `claude --bg`; ALTER rather than a
+            # new schema so an existing jobs.db keeps its history.
+            columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+            for column in ("agent_id", "session_id"):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
 
     def _connect(self):
         # One connection per thread: sqlite3 connections aren't safe to share
-        # across threads, and start_task/worker/handle() calls all come from
+        # across threads, and start_task/hook/handle() calls all come from
         # different ones.
         if not hasattr(self._local, "db"):
             self._local.db = sqlite3.connect(self.path, timeout=30)
         return self._local.db
 
-    def start(self, job_id, chat_id, thread_id, prompt):
+    def start(self, job_id, chat_id, thread_id, prompt, agent_id):
         with self._connect() as db:
             db.execute(
-                "INSERT INTO jobs (job_id, chat_id, thread_id, prompt, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
-                (job_id, str(chat_id), str(thread_id), prompt, time.time()),
+                "INSERT INTO jobs (job_id, chat_id, thread_id, prompt, status, created_at, agent_id) VALUES (?, ?, ?, ?, 'running', ?, ?)",
+                (job_id, str(chat_id), str(thread_id), prompt, time.time(), agent_id),
             )
 
     def finish(self, job_id, status, result):
@@ -468,22 +427,365 @@ class JobStore:
                 (status, (result or "")[:1500], time.time(), job_id),
             )
 
+    def set_session(self, job_id, session_id):
+        with self._connect() as db:
+            db.execute("UPDATE jobs SET session_id = ? WHERE job_id = ?", (session_id, job_id))
+
     def recent(self, limit=8):
         with self._connect() as db:
             return db.execute(
-                "SELECT job_id, status, prompt, created_at, finished_at FROM jobs ORDER BY created_at DESC LIMIT ?",
+                "SELECT job_id, status, prompt, created_at, finished_at, agent_id FROM jobs ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
 
     def get(self, job_id):
         with self._connect() as db:
             return db.execute(
-                "SELECT job_id, chat_id, thread_id, prompt, status, created_at, finished_at, result FROM jobs WHERE job_id = ?",
+                "SELECT job_id, chat_id, thread_id, prompt, status, created_at, finished_at, result, agent_id, session_id FROM jobs WHERE job_id = ?",
                 (job_id,),
+            ).fetchone()
+
+    def running(self):
+        with self._connect() as db:
+            return db.execute(
+                "SELECT job_id, chat_id, thread_id, prompt, agent_id FROM jobs WHERE status = 'running' ORDER BY created_at"
+            ).fetchall()
+
+    def running_for(self, thread_id):
+        """The job_id of the /task job currently holding this conversation,
+        if any. Checked instead of an in-process lock so the constraint (one
+        live claude session per conversation) still holds across a
+        controller restart, when no lock object exists any more."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT job_id FROM jobs WHERE status = 'running' AND thread_id = ? LIMIT 1",
+                (str(thread_id),),
+            ).fetchone()
+        return row[0] if row else None
+
+    def by_agent(self, agent_id):
+        """Route a hook payload back to its job. Claude Code's short agent id
+        is the first 8 characters of the session uuid the hooks report, so a
+        job is found either way round. Several rows can share a session id --
+        a /task job resumes the conversation's session, which an earlier job
+        may already own -- so the live one wins, then the most recent."""
+        with self._connect() as db:
+            return db.execute(
+                """SELECT job_id, chat_id, thread_id, prompt, status FROM jobs
+                   WHERE agent_id = ? OR session_id = ?
+                   ORDER BY status = 'running' DESC, created_at DESC LIMIT 1""",
+                (agent_id[:8], agent_id),
             ).fetchone()
 
 
 JOBS = JobStore(JOBS_DB_PATH)
+
+
+def hook_command(timeout):
+    """The shell command Claude Code runs for one hook event: POST the hook's
+    JSON payload (stdin) to this controller's unix socket, and write the
+    controller's JSON answer back to stdout, which is exactly the contract
+    a "command" hook has. A unix socket rather than a TCP port so the path
+    baked into the settings file stays valid across controller restarts and
+    nothing is ever reachable from the network."""
+    return (
+        f"curl -sS --max-time {timeout} --unix-socket {shlex.quote(HOOK_SOCKET_PATH)} "
+        "-H 'Content-Type: application/json' --data-binary @- http://localhost/hook"
+    )
+
+
+def write_hook_settings():
+    """(Re)write the settings file handed to every `claude --bg` job with
+    --settings. It is additive: the host's own ~/.claude/settings.json hooks
+    still apply, these are appended for background jobs only -- the
+    foreground /ask path never loads it."""
+    quick = [{"type": "command", "command": hook_command(30), "timeout": 45}]
+    document = {
+        "hooks": {
+            # One Telegram message per edited file, the same notification the
+            # foreground path builds from its stream-json events.
+            "PostToolUse": [{"matcher": "|".join(FILE_EDIT_TOOLS), "hooks": quick}],
+            # The completion callback: fires in the job's own process when the
+            # turn ends, and carries last_assistant_message -- the answer.
+            "Stop": [{"hooks": quick}],
+            # Backstop for a session that dies without finishing a turn.
+            "SessionEnd": [{"hooks": [{"type": "command", "command": hook_command(15), "timeout": 20}]}],
+            # Reports (but cannot answer) a prompt Claude Code raises itself.
+            "PermissionRequest": [{"hooks": quick}],
+        }
+    }
+    if CONFIRM_TOOLS:
+        # Blocks the job while the Allow/Deny buttons sit in Telegram.
+        document["hooks"]["PreToolUse"] = [{"matcher": CONFIRM_TOOLS, "hooks": [{
+            "type": "command",
+            "command": hook_command(PERMISSION_ASK_TIMEOUT),
+            "timeout": PERMISSION_ASK_TIMEOUT + 30,
+        }]}]
+    os.makedirs(os.path.dirname(HOOK_SETTINGS_PATH), exist_ok=True)
+    with open(HOOK_SETTINGS_PATH, "w", encoding="utf-8") as file:
+        json.dump(document, file, indent=2)
+
+
+# request_id -> {"event": Event, "decision": "allow"/"deny"}. One entry per
+# permission prompt currently parked in Telegram, waiting for a tap.
+PERMISSIONS = {}
+PERMISSIONS_LOCK = threading.Lock()
+# Held while a /task job is being spawned, and by every hook lookup, so a job
+# that finishes in under a second cannot fire its Stop hook before the row
+# that routes it back to Telegram exists.
+JOB_START_LOCK = threading.Lock()
+
+
+def _random_id(exists):
+    """3 random lowercase letters -- short and easy to type on a phone.
+    exists(candidate) rejects ids already taken (26**3 = 17,576 combinations
+    makes collisions rare for a single-user bot, but not impossible)."""
+    for _ in range(100):
+        candidate = "".join(random.choices(string.ascii_lowercase, k=3))
+        if not exists(candidate):
+            return candidate
+    raise RuntimeError("could not allocate a unique id")
+
+
+def _thread_of(thread_id):
+    """Telegram thread ids come back out of SQLite as strings, including the
+    literal "None" used outside forum topics."""
+    return None if thread_id in (None, "None", "") else int(thread_id)
+
+
+def _tool_summary(payload):
+    tool = payload.get("tool_name") or "a tool"
+    tool_input = payload.get("tool_input") or {}
+    detail = tool_input.get("command") or _tool_target_path(tool, tool_input)
+    if detail == "?":
+        detail = json.dumps(tool_input)[:300]
+    return tool, str(detail)[:800]
+
+
+def ask_permission(job_id, chat_id, thread_id, payload):
+    """Gate one tool call (a PreToolUse hook) on an Allow/Deny tap in
+    Telegram, blocking the job until it comes. Returning no decision on
+    timeout is deliberate: the call then goes back to Claude Code's normal
+    permission flow rather than being silently denied."""
+    tool, detail = _tool_summary(payload)
+    event = threading.Event()
+    with PERMISSIONS_LOCK:
+        request_id = _random_id(lambda candidate: candidate in PERMISSIONS)
+        PERMISSIONS[request_id] = {"event": event, "decision": None}
+    reply(
+        chat_id,
+        f"🔐 Job {job_id} wants to run {tool}:\n{detail}",
+        thread_id,
+        buttons=[("✅ allow", f"/allow {request_id}"), ("⛔ deny", f"/deny {request_id}")],
+        columns=2,
+    )
+    event.wait(PERMISSION_ASK_TIMEOUT)
+    with PERMISSIONS_LOCK:
+        decision = (PERMISSIONS.pop(request_id, None) or {}).get("decision")
+    if not decision:
+        reply(chat_id, f"⌛ Job {job_id}: no answer, handing the {tool} call back to Claude Code's own permission flow.", thread_id)
+        return {}
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+        "permissionDecisionReason": f"{decision} from Telegram",
+    }}
+
+
+def answer_permission(request_id, decision):
+    with PERMISSIONS_LOCK:
+        pending = PERMISSIONS.get(request_id)
+        if pending is None:
+            return False
+        pending["decision"] = decision
+    pending["event"].set()
+    return True
+
+
+def handle_hook(payload):
+    """Dispatch one hook POST from a background job. Everything is routed by
+    session id: the job's row in JOBS is what says which Telegram chat and
+    thread it belongs to, so this keeps working for jobs started before the
+    last controller restart."""
+    event = payload.get("hook_event_name")
+    session_id = payload.get("session_id") or ""
+    if not session_id:
+        return {}
+    with JOB_START_LOCK:
+        row = JOBS.by_agent(session_id)
+    if row is None:
+        return {}
+    job_id, chat_id, thread_id, prompt, status = row
+    thread_id = _thread_of(thread_id)
+    JOBS.set_session(job_id, session_id)
+    # A /task job's session is the conversation's session from now on, so a
+    # later /ask continues from the work the job just did.
+    CLAUDE.adopt_session(thread_id, session_id)
+    if event == "PostToolUse":
+        name = payload.get("tool_name")
+        if name not in FILE_EDIT_TOOLS:
+            return {}
+        tool_input = payload.get("tool_input") or {}
+        path = _tool_target_path(name, tool_input)
+        added, removed, preview = _edit_stats(name, tool_input)
+        header = f"✏️ {FILE_EDIT_TOOLS[name]} {path} (+{added} -{removed})"
+        if preview and added + removed < DIFF_PREVIEW_MAX_LINES:
+            reply(chat_id, header + "\n" + "\n".join(preview), thread_id)
+        else:
+            reply(chat_id, header, thread_id)
+        return {}
+    if event == "Stop":
+        if status != "running":
+            return {}
+        result = str(payload.get("last_assistant_message") or "(empty response)")
+        JOBS.finish(job_id, "completed", result)
+        reply(chat_id, f"✅ Background job {job_id} finished:\n{result}", thread_id)
+        return {}
+    if event == "SessionEnd":
+        # Only reached when the session died without completing a turn --
+        # a normal finish has already flipped the row to "completed" above.
+        if status != "running":
+            return {}
+        reason = str(payload.get("reason") or "session ended")
+        JOBS.finish(job_id, "failed", reason)
+        reply(chat_id, f"❌ Background job {job_id} ended without finishing: {reason}", thread_id)
+        return {}
+    if event == "PreToolUse":
+        return ask_permission(job_id, chat_id, thread_id, payload)
+    if event == "PermissionRequest":
+        # Claude Code decided this call needs a human, and ignores whatever a
+        # PermissionRequest hook answers (2.1.x), so all this can do is say
+        # where the job got stuck. TELEGRAM_CLAUDE_CONFIRM_TOOLS is the way
+        # to get a decision that actually lands (see ask_permission).
+        tool, detail = _tool_summary(payload)
+        reply(chat_id, f"🔐 Job {job_id} is blocked: Claude Code wants your permission for {tool}:\n{detail}\nAnswer it on the server with `claude attach {(session_id or '')[:8]}`, or /cancel {job_id}.", thread_id)
+        return {}
+    return {}
+
+
+class HookRequestHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            payload = {}
+        try:
+            answer = handle_hook(payload)
+        except Exception as error:
+            print(f"telegram-claude-control: hook failed: {error}", file=sys.stderr, flush=True)
+            answer = {}
+        body = json.dumps(answer).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def address_string(self):
+        return "hook"
+
+    def log_message(self, *args):
+        pass
+
+
+class HookServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """HTTP over an AF_UNIX socket. Threaded because a confirmation hook parks
+    its connection for as long as the Allow/Deny buttons go unanswered, and
+    other jobs must keep reporting in meanwhile."""
+
+    address_family = socket.AF_UNIX
+    daemon_threads = True
+
+    def server_bind(self):
+        # HTTPServer.server_bind() would try to resolve the "host" of the
+        # bound address, which for AF_UNIX is a filesystem path.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = 0
+
+
+def start_hook_server(path=HOOK_SOCKET_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # A socket file left behind by a killed controller would make bind()
+    # fail; the unit is single-instance, so the stale one is always ours.
+    if os.path.exists(path):
+        os.unlink(path)
+    server = HookServer(path, HookRequestHandler)
+    os.chmod(path, 0o600)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def agents_state():
+    """{agent_id: session dict} from `claude agents --json --all`, Claude
+    Code's own view of its background sessions (state, cwd, session id).
+    Empty on any failure -- it is only ever used to enrich or reconcile what
+    JOBS already knows."""
+    try:
+        result = subprocess.run(
+            [CLAUDE_BIN, "agents", "--json", "--all"],
+            capture_output=True, text=True, timeout=60,
+        )
+        # Tolerate anything a wrapper script may print before the array.
+        start = result.stdout.index("[")
+        rows = json.loads(result.stdout[start:])
+    except Exception as error:
+        print(f"telegram-claude-control: claude agents failed: {error}", file=sys.stderr, flush=True)
+        return {}
+    return {row["id"]: row for row in rows if isinstance(row, dict) and row.get("id")}
+
+
+def start_job(chat_id, thread_id, prompt):
+    """Dispatch prompt as a `claude --bg` background session. Returns
+    (job_id, agent_id); raises on failure. The session is owned by Claude
+    Code's daemon, so it keeps running (and keeps reporting to Telegram
+    through the hooks) across a restart of this controller."""
+    prefix, cwd = CLAUDE.command_prefix(thread_id)
+    with JOB_START_LOCK:
+        job_id = _random_id(lambda candidate: JOBS.get(candidate) is not None)
+        args = [CLAUDE_BIN, "--bg", prompt, "--settings", HOOK_SETTINGS_PATH, "--name", f"telegram {job_id}"] + prefix
+        result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=180)
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout).strip()[:1500] or f"claude --bg exited {result.returncode}")
+        # "backgrounded · 7c5dcf5d · <name>" -- the short id is also the
+        # first 8 characters of the session uuid the hooks report.
+        match = re.search(r"backgrounded\s+\S\s+([0-9a-f]{6,})", result.stdout)
+        if match is None:
+            raise RuntimeError((result.stdout or result.stderr).strip()[:1500] or "claude --bg printed no session id")
+        agent_id = match.group(1)
+        JOBS.start(job_id, chat_id, thread_id, prompt, agent_id)
+    return job_id, agent_id
+
+
+def reconcile_jobs():
+    """Called at startup: settle every row still marked "running". A job whose
+    session is alive is simply re-adopted -- its hooks will find it again
+    now that the socket is back. One that finished while the controller was
+    down is closed out (its Stop hook had nowhere to post), and one Claude
+    Code no longer knows about is flagged interrupted, as before. Returns
+    the messages to send to Telegram."""
+    rows = JOBS.running()
+    if not rows:
+        return []
+    agents = agents_state()
+    messages = []
+    for job_id, chat_id, thread_id, prompt, agent_id in rows:
+        agent = agents.get(agent_id) if agent_id else None
+        state = (agent or {}).get("state")
+        if state in ("working", "blocked"):
+            continue
+        if state in ("done", "failed", "stopped"):
+            status = "completed" if state == "done" else "failed"
+            JOBS.finish(job_id, status, f"({state} while the controller was down)")
+            icon = STATUS_ICONS.get(status, "?")
+            messages.append((chat_id, _thread_of(thread_id), f"{icon} Background job {job_id} {state} while the controller was restarting.\nPrompt: {prompt[:800]}\nFull output: claude logs {agent_id}"))
+            continue
+        JOBS.finish(job_id, "interrupted", "(session no longer known to claude)")
+        messages.append((chat_id, _thread_of(thread_id), f"⚠️ Background job {job_id} was lost (its background session is gone).\nPrompt: {prompt[:800]}"))
+    return messages
 
 
 class TelegramApi:
@@ -734,31 +1036,31 @@ def run_ask(chat_id, thread_id, prompt):
 
 
 def start_task(chat_id, message_id, thread_id, prompt):
-    """Start a /task job: unlike /ask, this is not bound by ASK_TIMEOUT, so a
-    job can run for hours. notify (here, reply) delivers both progress and
-    the final completion/failure message whenever the job actually ends.
-    on_start/on_done record the job in JOBS (SQLite) so /tasks history and
-    status survive a controller restart."""
-    job_id = CLAUDE.start_background(
-        prompt,
-        conversation_id=thread_id,
-        thread_id=thread_id,
-        notify=lambda text: reply(chat_id, text, thread_id),
-        on_start=lambda job_id: JOBS.start(job_id, chat_id, thread_id, prompt),
-        on_done=lambda job_id, status, text: JOBS.finish(job_id, status, text),
-        job_id_exists=lambda job_id: JOBS.get(job_id) is not None,
-    )
-    if job_id is None:
-        reply(chat_id, "A request is already running for this conversation. Check /tasks, or wait for it to finish.", thread_id)
+    """Start a /task job as a `claude --bg` session. Unlike /ask this has no
+    timeout at all and is not owned by this process: the job keeps running
+    (and keeps reporting edits, its result, and any permission prompt to
+    this chat, through the hooks in HOOK_SETTINGS_PATH) even across a
+    /restart of the controller."""
+    busy = JOBS.running_for(thread_id)
+    if busy:
+        reply(chat_id, f"Background job {busy} is already running for this conversation. Check /tasks, or /cancel {busy}.", thread_id)
+        return
+    try:
+        job_id, agent_id = start_job(chat_id, thread_id, prompt)
+    except Exception as error:
+        print(f"telegram-claude-control: /task failed: {error}", file=sys.stderr, flush=True)
+        reply(chat_id, _friendly_claude_error(error), thread_id)
         return
     try:
         acknowledge(chat_id, message_id)
     except Exception as error:
         print(f"telegram-claude-control: reaction failed: {error}", file=sys.stderr, flush=True)
-    reply(chat_id, f"Started background job {job_id}. You'll get a message here when it finishes.", thread_id)
+    reply(chat_id, f"Started background job {job_id} (claude session {agent_id}). You'll get a message here as it edits files, when it needs a permission, and when it finishes.", thread_id)
 
 
 STATUS_ICONS = {"running": "🏃", "completed": "✅", "failed": "❌", "cancelled": "🚫", "interrupted": "⚠️"}
+# `claude agents --json` state -> what to show for a row still marked running.
+AGENT_STATES = {"working": "🏃 working", "blocked": "🔐 needs input", "done": "✅ done", "failed": "❌ failed", "stopped": "🚫 stopped"}
 
 
 def human_duration(seconds):
@@ -779,17 +1081,23 @@ def tasks_summary():
     """(text, buttons) for the 5 most recent /task jobs -- text shows all 5
     at a glance, and each also gets a button (callback_data "/tasks
     <job_id>") that drills into job_detail()'s duration/prompt/result view,
-    the same as tapping through /screen's picker."""
+    the same as tapping through /screen's picker. Rows still running are
+    annotated with Claude Code's own live view of the session (working, or
+    blocked on a permission prompt)."""
     rows = JOBS.recent(5)
     if not rows:
         return "No background jobs yet.", None
+    agents = agents_state() if any(row[1] == "running" for row in rows) else {}
     now = time.time()
     lines = []
     buttons = []
-    for job_id, status, prompt, created_at, finished_at in rows:
+    for job_id, status, prompt, created_at, finished_at, agent_id in rows:
         icon = STATUS_ICONS.get(status, "?")
+        label = status
+        if status == "running":
+            label = AGENT_STATES.get((agents.get(agent_id) or {}).get("state"), status)
         duration = human_duration((finished_at or now) - created_at)
-        lines.append(f"{icon} {job_id} ({status}, {duration}): {prompt[:80]}")
+        lines.append(f"{icon} {job_id} ({label}, {duration}): {prompt[:80]}")
         buttons.append((f"{icon} {job_id}", f"/tasks {job_id}"))
     return "\n".join(lines), buttons
 
@@ -798,21 +1106,39 @@ def job_detail(job_id):
     row = JOBS.get(job_id)
     if row is None:
         return f"No job {job_id}."
-    job_id, chat_id, thread_id, prompt, status, created_at, finished_at, result = row
+    job_id, chat_id, thread_id, prompt, status, created_at, finished_at, result, agent_id, session_id = row
     now = time.time()
     lines = [
         f"{STATUS_ICONS.get(status, '?')} {job_id} — {status}",
         f"Duration: {human_duration((finished_at or now) - created_at)}",
         f"Thread: {thread_id}",
+        f"Session: {agent_id or '?'} (claude attach {agent_id or ''}, claude logs {agent_id or ''})",
         f"Prompt: {prompt[:800]}",
     ]
+    if status == "running":
+        state = (agents_state().get(agent_id) or {}).get("state")
+        lines.insert(1, f"Live state: {AGENT_STATES.get(state, state or 'unknown to claude')}")
     if result:
         lines.append(f"Last message: {result[:1500]}")
     return "\n".join(lines)
 
 
 def cancel_job(job_id):
-    return f"Cancelled {job_id}." if CLAUDE.cancel_job(job_id) else f"No running background job {job_id}."
+    """Stop the job's background session with `claude stop`. Its conversation
+    is kept by Claude Code either way, so the work so far stays resumable
+    with a fresh /ask or /task on this Telegram thread."""
+    row = JOBS.get(job_id)
+    if row is None or row[4] != "running":
+        return f"No running background job {job_id}."
+    agent_id = row[8]
+    try:
+        result = subprocess.run([CLAUDE_BIN, "stop", agent_id], capture_output=True, text=True, timeout=60)
+    except Exception as error:
+        return f"Could not stop {job_id}: {error}"
+    JOBS.finish(job_id, "cancelled", (result.stdout or result.stderr).strip()[:300])
+    if result.returncode != 0:
+        return f"Marked {job_id} cancelled, but claude stop failed: {(result.stderr or result.stdout).strip()[:300]}"
+    return f"Cancelled {job_id}."
 
 
 def list_projects():
@@ -944,6 +1270,12 @@ def acknowledge(chat_id, message_id):
 
 def start_ask(chat_id, message_id, thread_id, prompt):
     """Acknowledge promptly, then run the request asynchronously."""
+    # A /task job owns this conversation's claude session for as long as it
+    # runs, and two processes must not resume the same session at once.
+    busy = JOBS.running_for(thread_id)
+    if busy:
+        reply(chat_id, f"Background job {busy} is running for this conversation. Wait for it, or /cancel {busy}.", thread_id)
+        return
     try:
         acknowledge(chat_id, message_id)
     except Exception as error:
@@ -1030,11 +1362,13 @@ def handle(message, state):
             "/newsession: forget the headless conversation and start fresh. "
             "/tmux <text>: terminal input into the interactive session, then last 30 lines after 20 seconds. "
             "/sh <command>: run a shell command directly and return its output. "
-            "/task <prompt>: run headless `claude -p` in the background, not bound by the usual timeout; "
-            "you get a message here the moment it finishes (or fails). "
-            "/tasks: the 5 most recent background jobs, each tappable for its "
-            "duration/prompt/last message (survives a restart). /tasks <job_id>: same detail directly. "
-            "/cancel <job_id>: kill a running one. "
+            "/task <prompt>: run it as a `claude --bg` background agent, with no timeout and hosted by "
+            "Claude Code's own daemon, so it keeps running (and keeps reporting here) even across a /restart. "
+            "You get a message per edited file, Allow/Deny buttons whenever it needs a permission, "
+            "and its answer the moment it finishes (or fails). "
+            "/tasks: the 5 most recent background jobs with their live state, each tappable for its "
+            "duration/prompt/last message. /tasks <job_id>: same detail directly. "
+            "/cancel <job_id>: stop a running one (its conversation is kept, /ask continues it). "
             "/restart: restart the controller's systemd service. "
             "/screen: every tmux pane on the server as a button, tap to see its content. "
             "/model: show/pick the Claude model for this conversation (sonnet/opus/haiku or any model id); "
@@ -1108,6 +1442,14 @@ def handle(message, state):
         reply(chat_id, "Usage: /cancel <job_id>", thread_id)
     elif command.startswith("/cancel "):
         reply(chat_id, cancel_job(command[8:].strip()), thread_id)
+    elif command.startswith("/allow ") or command.startswith("/deny "):
+        # Answers to the buttons on a background job's permission prompt;
+        # the blocked hook is waiting on exactly this (see ask_permission).
+        decision, _, request_id = command[1:].partition(" ")
+        if answer_permission(request_id.strip(), "allow" if decision == "allow" else "deny"):
+            reply(chat_id, f"{'✅ Allowed' if decision == 'allow' else '⛔ Denied'}, the job continues.", thread_id)
+        else:
+            reply(chat_id, "That permission request is no longer waiting (answered already, or timed out).", thread_id)
     elif command == "/restart":
         # Reply (a blocking network call) completes before systemd's SIGTERM
         # can land, so the acknowledgment always reaches Telegram -- even
@@ -1203,15 +1545,15 @@ def main():
         register_bot_commands()
     except Exception as error:
         print(f"telegram-claude-control: setMyCommands failed: {error}", file=sys.stderr, flush=True)
-    for job_id, chat_id, thread_id, prompt in JOBS.interrupted_on_startup:
+    # Before anything else: background jobs started by an earlier run of this
+    # controller are still going, and their next hook must find the socket.
+    write_hook_settings()
+    start_hook_server()
+    for chat_id, thread_id, text in reconcile_jobs():
         try:
-            reply(
-                chat_id,
-                f"⚠️ Background job {job_id} was interrupted by a controller restart before finishing.\nPrompt: {prompt[:800]}\nResume with /ask or /task on this conversation to continue.",
-                None if thread_id == "None" else int(thread_id),
-            )
+            reply(chat_id, text, thread_id)
         except Exception as error:
-            print(f"telegram-claude-control: interrupted-job notice failed for {job_id}: {error}", file=sys.stderr, flush=True)
+            print(f"telegram-claude-control: startup job notice failed: {error}", file=sys.stderr, flush=True)
     while True:
         try:
             updates = api("getUpdates", {"offset": state.get("offset", 0), "timeout": 30, "allowed_updates": json.dumps(["message", "callback_query"])})
@@ -1248,7 +1590,20 @@ def check():
         report(False, f"config file: {error}")
 
     report(shutil.which("tmux") is not None, "tmux is on PATH")
+    # /task hooks post their payload to the controller with curl.
+    report(shutil.which("curl") is not None, "curl is on PATH (background-job hooks)")
     report(os.access(CLAUDE_BIN, os.X_OK) or shutil.which(CLAUDE_BIN) is not None, f"claude binary is executable: {CLAUDE_BIN}")
+    # A sibling path, never HOOK_SOCKET_PATH itself: --check must not unlink
+    # the socket a running controller's background jobs are reporting to.
+    probe = HOOK_SOCKET_PATH + ".check"
+    try:
+        server = start_hook_server(probe)
+        server.shutdown()
+        server.server_close()
+        os.unlink(probe)
+        report(True, f"hook socket is bindable: {HOOK_SOCKET_PATH}")
+    except Exception as error:
+        report(False, f"hook socket {HOOK_SOCKET_PATH}: {error}")
     report(os.path.isdir(WORKSPACE), f"workspace directory exists: {WORKSPACE}")
     report(tmux("has-session", "-t", SESSION).returncode == 0, f"tmux session '{SESSION}' is available", fatal=False)
 

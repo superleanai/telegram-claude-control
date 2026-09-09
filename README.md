@@ -25,10 +25,11 @@ the `claude` binary directly, the same way you would from a terminal.
 | `/usage` | Current session/weekly usage against your plan's limits — free, instant, uses no tokens. `/help` also offers this as a button. |
 | `/tmux <text>` | Types text and Enter into an interactive `claude` session running in the configured tmux window, then returns its recent output. |
 | `/sh <command>` | Runs a shell command directly (not through tmux) and returns its combined stdout/stderr. |
-| `/task <prompt>` | Runs `claude -p` headless in the background, not bound by the `/ask` timeout — a message with the result (or failure) lands here whenever the job actually finishes, even hours later. Replies with a 3-letter job id (e.g. `abc`), short enough to type back for `/tasks <job_id>` or `/cancel <job_id>`. |
-| `/tasks` | One message listing the 5 most recent background jobs (icon, id, status, duration, prompt), each also a tappable button into its detail view — history survives a controller restart. |
-| `/tasks <job_id>` | Detail view: status, duration, thread, full prompt, and last message/error — what tapping a `/tasks` button does. |
-| `/cancel <job_id>` | Kills a running background job. |
+| `/task <prompt>` | Dispatches the prompt as a `claude --bg` background agent: no timeout, and hosted by Claude Code's own daemon rather than by this controller, so it keeps running — and keeps reporting here — across a `/restart` or a crash. A message with the result (or failure) lands here whenever the job actually finishes, even hours later. Replies with a 3-letter job id (e.g. `abc`), short enough to type back for `/tasks <job_id>` or `/cancel <job_id>`. |
+| `/tasks` | One message listing the 5 most recent background jobs (icon, id, live state, duration, prompt), each also a tappable button into its detail view — history survives a controller restart. |
+| `/tasks <job_id>` | Detail view: status, live state, duration, thread, the `claude attach`/`claude logs` id, full prompt, and last message/error — what tapping a `/tasks` button does. |
+| `/cancel <job_id>` | Stops a running background job (`claude stop`). Its conversation is kept, so `/ask` continues from where it got to. |
+| `/allow <id>`, `/deny <id>` | Answers a background job's tool-confirmation request (`TELEGRAM_CLAUDE_CONFIRM_TOOLS`). Never typed — these are the Allow/Deny buttons on the 🔐 message the job sends. |
 | `/restart` | Restarts the controller's systemd `--user` service (see Install). |
 | `/screen` | One message listing every pane across the whole tmux server as a button (even if there's only one) — tap to capture and return its content. |
 | `/screen_show <target>` | Captures and returns a specific tmux target directly (e.g. `web:1`, `web:1.0`) — what the `/screen` buttons call under the hood. |
@@ -114,15 +115,50 @@ a second request on the same topic is rejected with a "already running"
 reply rather than queued. Different topics run fully in parallel, so a
 long `/task` job in one topic never blocks `/ask` in another.
 
-Every `/task` job is logged to a small SQLite database
-(`TELEGRAM_CLAUDE_JOBS_DB`) as it starts and finishes, so `/tasks` history
-survives a controller restart even though the underlying `claude -p`
-subprocess itself can't: a job still marked "running" when the controller
-starts up is a leftover from a previous process and gets flagged
-"interrupted" rather than left looking falsely active. The conversation
-itself isn't lost either way — it's still resumable normally via `--resume`
-with a fresh `/ask` or `/task` on the same topic — only that specific job's
-progress tracking ends at the interruption.
+### Background jobs (`/task`) and how they survive a restart
+
+A `/task` job is not a child of this controller. It is dispatched with
+`claude --bg`, which hands the session to Claude Code's own background
+supervisor (`claude daemon`), and the controller only keeps a row about it in
+a small SQLite database (`TELEGRAM_CLAUDE_JOBS_DB`) mapping the session to
+the Telegram chat and topic that started it.
+
+Everything a job has to say comes back through hooks that the job's own
+process fires, configured in a generated settings file
+(`TELEGRAM_CLAUDE_HOOK_SETTINGS`) passed to it with `--settings`, and posted
+with `curl` to a unix socket the controller listens on
+(`TELEGRAM_CLAUDE_HOOK_SOCKET`):
+
+| Hook | Telegram |
+| --- | --- |
+| `PostToolUse` on the file-editing tools | ✏️ one message per edited file, with the diff |
+| `Stop` | ✅ the finished job's answer (`last_assistant_message`) |
+| `SessionEnd` without a finished turn | ❌ the job died |
+| `PermissionRequest` | 🔐 the tool and its input, saying the job is blocked on a prompt Claude Code raised itself — a report only, see below |
+| `PreToolUse`, only for `TELEGRAM_CLAUDE_CONFIRM_TOOLS` | 🔐 the tool and its input, with Allow/Deny buttons — the job stays blocked, inside the hook, until a button is tapped or `TELEGRAM_CLAUDE_PERMISSION_ASK_TIMEOUT` passes |
+
+Approving from Telegram works through `PreToolUse`, not `PermissionRequest`:
+in Claude Code 2.1.x a `PermissionRequest` hook does fire in a background
+session, but its `permissionDecision` is ignored there (verified — its own
+bundled reference scopes `permissionDecision` to `PreToolUse`), so a prompt
+Claude Code raises by itself can only be reported here and has to be
+answered on the server with `claude attach <id>`. Setting
+`TELEGRAM_CLAUDE_CONFIRM_TOOLS` (e.g. `Bash`, or `Bash|Write|Edit`) puts the
+gate one step earlier instead, on `PreToolUse`, whose allow/deny *is*
+honoured — so those tools ask Telegram first and never reach a prompt.
+
+Because the socket path is fixed, this survives the controller being
+restarted mid-job: the session keeps working while the controller is down,
+and its next hook finds the socket again and lands in the right chat. At
+startup every row still marked "running" is reconciled against `claude
+agents --json` — still working or blocked, it is simply re-adopted; finished
+while the controller was down, it is closed out with a message; unknown to
+Claude Code, it is flagged "interrupted". A job's session also becomes the
+topic's session, so a later `/ask` continues from the work the job did.
+
+Nothing about a job is lost when the controller is not around: on the server
+`claude agents` lists them, `claude logs <id>` prints output, and `claude
+attach <id>` opens one in a terminal.
 
 `/screen` walks the *entire* tmux server, not just `TELEGRAM_CLAUDE_SESSION`
 — every pane in every window of every session gets its own button, always,
@@ -228,15 +264,18 @@ Optional environment variables:
 | --- | --- | --- |
 | `TELEGRAM_CLAUDE_CONFIG` | `~/.config/telegram-claude-control.env` | Secret config file. |
 | `TELEGRAM_CLAUDE_STATE` | `~/.local/state/telegram-claude-control.json` | Pairing state and Telegram update offset. |
-| `TELEGRAM_CLAUDE_JOBS_DB` | `~/.local/state/telegram-claude-control-jobs.db` | SQLite log of `/task` jobs, for `/tasks` history across restarts. |
+| `TELEGRAM_CLAUDE_JOBS_DB` | `~/.local/state/telegram-claude-control-jobs.db` | SQLite registry of `/task` jobs: `/tasks` history, and the mapping from a background session to its Telegram chat. |
+| `TELEGRAM_CLAUDE_HOOK_SOCKET` | `~/.local/state/telegram-claude-control-hooks.sock` | Unix socket the hooks of `/task` jobs post to. |
+| `TELEGRAM_CLAUDE_HOOK_SETTINGS` | `~/.local/state/telegram-claude-control-hooks.json` | Generated `--settings` file handed to every `/task` job; rewritten at startup. |
 | `TELEGRAM_CLAUDE_SESSION` | `claude` | tmux target session for the `/tmux` bridge. |
 | `TELEGRAM_CLAUDE_WORKSPACE` | `$HOME` | Default working directory for headless `claude -p` calls, used when a conversation has no `/projects` selection. |
 | `TELEGRAM_CLAUDE_PROJECTS_DIR` | `$HOME` | Directory `/projects` scans for selectable project subdirectories. |
 | `TELEGRAM_CLAUDE_BIN` | `~/.local/bin/claude` | Path to the `claude` executable. |
-| `TELEGRAM_CLAUDE_PERMISSION_MODE` | *(unset)* | Passed as `--permission-mode` to headless calls. Leave unset to inherit whatever `permissions.defaultMode` is configured in `~/.claude/settings.json`. |
+| `TELEGRAM_CLAUDE_PERMISSION_MODE` | *(unset)* | Passed as `--permission-mode` to headless calls and `/task` jobs. Leave unset to inherit whatever `permissions.defaultMode` is configured in `~/.claude/settings.json`. A mode that actually prompts turns every prompt in a `/task` job into 🔐 Allow/Deny buttons in Telegram; `bypassPermissions` means it never asks. |
 | `TELEGRAM_CLAUDE_ASK_TIMEOUT` | `600` | Seconds to wait for a headless `claude -p` turn before giving up. |
 | `TELEGRAM_CLAUDE_SH_TIMEOUT` | `60` | Seconds to wait for a `/sh` command before giving up. |
-| `TELEGRAM_CLAUDE_TASK_TIMEOUT` | `14400` | Seconds to wait for a `/task` background job before giving up (4 hours). |
+| `TELEGRAM_CLAUDE_CONFIRM_TOOLS` | *(unset)* | Hook matcher (e.g. `Bash`, `Bash\|Write\|Edit`, `*`) for tools a `/task` job must get an explicit Telegram Allow/Deny tap for. Unset means no extra gate. |
+| `TELEGRAM_CLAUDE_PERMISSION_ASK_TIMEOUT` | `1800` | Seconds a `/task` job stays blocked on its 🔐 Allow/Deny buttons. After that the tool call goes back to Claude Code's normal permission flow. |
 | `TELEGRAM_CLAUDE_USAGE_TIMEOUT` | `30` | Seconds to wait for `/usage` before giving up. |
 | `TELEGRAM_CLAUDE_UNIT` | `telegram-claude-controller.service` | systemd `--user` unit name that `/restart` restarts. |
 | `TELEGRAM_CLAUDE_DIFF_PREVIEW_LINES` | `10` | Inline the diff in an edited-file notification when total changed lines (added + removed) is below this; otherwise show only the counts. |
