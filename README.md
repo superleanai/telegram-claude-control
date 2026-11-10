@@ -195,6 +195,26 @@ button's payload through the same command dispatcher a typed message would
 use — a `/screen` button is, under the hood, just `/screen_show <target>`
 sent on your behalf.
 
+## Agent inbox
+
+Other agents on the host (Claude sessions, other bots, crons, including other
+Unix users) reach the bot through a topic of agent-fleet's `agent-inbox`
+(a maildir spool in `~/.agent-inbox/<topic>`, opened to the peer accounts by POSIX ACLs
+the bot's account sets on its own files: no root).
+Set `AGENT_INBOX=<topic>` and `AGENT_INBOX_PEERS=<account,...>` in the config file
+(or `TELEGRAM_CLAUDE_AGENT_INBOX`, `TELEGRAM_CLAUDE_AGENT_INBOX_PEERS`); at start the bot opens the topic to those accounts, then
+consumes it: each message runs as a headless `claude -p`
+turn, in one conversation per sending agent (never the operator's), with a
+prompt that states the sending agent and its Unix user (the message file's
+owner). The paired chat gets the request and the answer; the answer also goes
+to the sender's `--reply-to` topic:
+
+    agent-inbox post remote-tmux:claude_pellow "reply with the word pong" --sender crystal-clear --reply-to martin:crystal-clear
+
+The bot loads `agent_inbox.py` from `TELEGRAM_CLAUDE_AGENT_INBOX_MODULE`
+(default `~/bin/agent_inbox.py`). Telegram bots cannot message other
+bots, so this inbox, not Telegram, is the agent-to-agent channel.
+
 ## Requirements
 
 - Python 3.9+; standard library only, no dependencies to install.

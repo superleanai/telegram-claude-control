@@ -81,6 +81,13 @@ UNIT_NAME = os.environ.get("TELEGRAM_CLAUDE_UNIT", "telegram-claude-controller.s
 # answer every message in a group. One-to-one chats are never gated: there is
 # no one else there to address.
 ADDRESS_NAME = os.environ.get("TELEGRAM_CLAUDE_ADDRESS_NAME")
+# Agent inbox: other agents on the host (other Unix users included) post to a
+# topic of agent-fleet's agent_inbox.py; each message runs as a headless turn
+# (one conversation per sending agent) and its answer is posted to the
+# sender's reply topic. AGENT_INBOX (config file, or TELEGRAM_CLAUDE_AGENT_INBOX)
+# names the topic; unset disables it.
+AGENT_INBOX_MODULE = os.environ.get("TELEGRAM_CLAUDE_AGENT_INBOX_MODULE", os.path.expanduser("~/bin/agent_inbox.py"))
+AGENT_INBOX_POLL = float(os.environ.get("TELEGRAM_CLAUDE_AGENT_INBOX_POLL", "5"))
 # Filled in at startup from getMe, for @username mentions and reply detection.
 BOT_IDENTITY = {"username": "", "id": None, "first_name": ""}
 # /model button shortcuts; /model <any other id> is also accepted verbatim.
@@ -1044,6 +1051,97 @@ def run_ask(chat_id, thread_id, prompt):
             reply(chat_id, _friendly_claude_error(error), thread_id)
 
 
+INBOX = None  # the agent_inbox module, loaded when a topic is configured
+INBOX_TOPIC = ""
+
+
+def load_agent_inbox(path=None):
+    import importlib.machinery
+    import importlib.util
+    path = path or AGENT_INBOX_MODULE
+    loader = importlib.machinery.SourceFileLoader("agent_inbox", path)
+    spec = importlib.util.spec_from_loader("agent_inbox", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def inbox_prompt(topic, msg):
+    """The turn prompt for one inbox message: who sent it, then the text."""
+    sender = msg.get("sender") or "an unnamed agent"
+    reply_to = msg.get("reply_to")
+    where = (f"Your final answer is posted back to agent-inbox topic {reply_to}."
+             if reply_to else "The sender gave no reply topic: only the operator sees your answer.")
+    refs = msg.get("refs") or []
+    body = str(msg["text"]).strip() + ("\n\nrefs:\n" + "\n".join(f"- {r}" for r in refs) if refs else "")
+    return (f"[Message from agent {sender} (Unix user {msg.get('poster', '?')}) via agent-inbox topic "
+            f"{topic}, posted {msg.get('posted_at', '?')}. It was not typed by the operator. {where}]\n\n{body}")
+
+
+def inbox_conversation(msg):
+    """One headless conversation per sending agent, apart from the operator's."""
+    return f"inbox:{msg.get('sender') or msg.get('poster') or '?'}"
+
+
+def handle_inbox_message(path, msg, state):
+    """Run one inbox message as a headless turn, copy it to the paired chat,
+    post the answer to the sender's reply topic, then ack it (a controller
+    that dies mid-turn runs it again: at-least-once)."""
+    chat_id = state.get("chat_id")
+    sender, poster, reply_to = msg.get("sender") or "?", msg.get("poster", "?"), msg.get("reply_to")
+    first = str(msg["text"]).strip().splitlines()[0][:200]
+    if chat_id:
+        reply(chat_id, f"📬 Inbox {INBOX_TOPIC}: {sender} (user {poster})"
+                       + (f", answer to {reply_to}" if reply_to else "") + f"\n{first}")
+    try:
+        answer = CLAUDE.run(inbox_prompt(INBOX_TOPIC, msg), conversation_id=inbox_conversation(msg))
+    except Exception as error:
+        print(f"telegram-claude-control: inbox request failed: {error}", file=sys.stderr, flush=True)
+        answer = f"Request failed: {_friendly_claude_error(error)}"
+    if chat_id:
+        reply(chat_id, f"📬 Answer to {sender}:\n{answer}")
+    if reply_to:
+        try:
+            INBOX.post(reply_to, answer or "(empty answer)", sender=INBOX_TOPIC, kind="peer", reply_to=INBOX_TOPIC)
+        except Exception as error:
+            print(f"telegram-claude-control: inbox reply to {reply_to} failed: {error}", file=sys.stderr, flush=True)
+    INBOX.ack(path)
+
+
+def take_inbox(state):
+    """Run every pending inbox message, oldest first."""
+    for path in INBOX.pending(INBOX_TOPIC):
+        try:
+            msg = INBOX.read(path)
+        except (OSError, ValueError) as error:
+            print(f"telegram-claude-control: inbox: skipped {path.name}: {error}", file=sys.stderr, flush=True)
+            INBOX.ack(path)
+            continue
+        handle_inbox_message(path, msg, state)
+
+
+def start_inbox(topic, state, peers=()):
+    """Claim the topic (one consumer per topic) and run it in a thread."""
+    global INBOX, INBOX_TOPIC
+    module = load_agent_inbox()
+    for change in module.open_topic(topic, list(peers)):  # ~/.agent-inbox/<topic>, ACLs for the peers
+        print(f"agent inbox: {change}", file=sys.stderr, flush=True)
+    lock = module.ConsumerLock(topic, "auto")
+    lock.acquire()
+    INBOX, INBOX_TOPIC = module, topic
+
+    def loop():
+        while True:
+            try:
+                take_inbox(state)
+            except Exception as error:
+                print(f"telegram-claude-control: inbox: {error}", file=sys.stderr, flush=True)
+            time.sleep(AGENT_INBOX_POLL)
+
+    threading.Thread(target=loop, name="agent-inbox", daemon=True).start()
+    return lock
+
+
 def start_task(chat_id, message_id, thread_id, prompt):
     """Start a /task job as a `claude --bg` session. Unlike /ask this has no
     timeout at all and is not owned by this process: the job keeps running
@@ -1629,6 +1727,13 @@ def main():
     # controller are still going, and their next hook must find the socket.
     write_hook_settings()
     start_hook_server()
+    topic = CFG.get("AGENT_INBOX") or os.environ.get("TELEGRAM_CLAUDE_AGENT_INBOX", "")
+    if topic:
+        try:
+            peers = [u for u in (CFG.get("AGENT_INBOX_PEERS") or os.environ.get("TELEGRAM_CLAUDE_AGENT_INBOX_PEERS", "")).split(",") if u.strip()]
+            start_inbox(topic, state, [u.strip() for u in peers])
+        except Exception as error:  # the Telegram side still works without it
+            print(f"telegram-claude-control: agent inbox {topic} disabled: {error}", file=sys.stderr, flush=True)
     for chat_id, thread_id, text in reconcile_jobs():
         try:
             reply(chat_id, text, thread_id)
