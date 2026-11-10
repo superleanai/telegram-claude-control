@@ -1053,6 +1053,7 @@ def run_ask(chat_id, thread_id, prompt):
 
 INBOX = None  # the agent_inbox module, loaded when a topic is configured
 INBOX_TOPIC = ""
+INBOX_LOCK = None
 
 
 def load_agent_inbox(path=None):
@@ -1122,13 +1123,13 @@ def take_inbox(state):
 
 def start_inbox(topic, state, peers=()):
     """Claim the topic (one consumer per topic) and run it in a thread."""
-    global INBOX, INBOX_TOPIC
+    global INBOX, INBOX_TOPIC, INBOX_LOCK
     module = load_agent_inbox()
     for change in module.open_topic(topic, list(peers)):  # ~/.agent-inbox/<topic>, ACLs for the peers
         print(f"agent inbox: {change}", file=sys.stderr, flush=True)
     lock = module.ConsumerLock(topic, "auto")
     lock.acquire()
-    INBOX, INBOX_TOPIC = module, topic
+    INBOX, INBOX_TOPIC, INBOX_LOCK = module, topic, lock  # held for the process's life: its flock says "live"
 
     def loop():
         while True:

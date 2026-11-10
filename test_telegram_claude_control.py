@@ -63,6 +63,18 @@ class AgentInboxTests(unittest.TestCase):
         (answer,) = [self.inbox.read(p) for p in self.inbox.pending("a")]
         self.assertTrue(answer["text"].startswith("Request failed:"))
 
+    def test_start_inbox_keeps_the_consumer_lock(self):
+        import gc
+        from unittest import mock
+
+        with mock.patch.object(controller, "load_agent_inbox", return_value=self.inbox), \
+             mock.patch.object(self.inbox, "open_topic", return_value=[]), \
+             mock.patch.object(controller.threading, "Thread"):
+            controller.start_inbox("claude_pellow", {})
+        self.addCleanup(lambda: controller.INBOX_LOCK.release())
+        gc.collect()
+        self.assertIsNotNone(self.inbox.probe_consumer("claude_pellow"))  # still live
+
 
 if __name__ == "__main__":
     unittest.main()
